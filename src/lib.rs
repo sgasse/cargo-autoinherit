@@ -1,6 +1,7 @@
 use crate::dedup::MinimalVersionSet;
 use anyhow::Context;
 use cargo_manifest::{Dependency, DependencyDetail, DepsSet, Manifest};
+use guppy::graph::PackageGraph;
 use guppy::VersionReq;
 use std::collections::{BTreeMap, BTreeSet};
 use std::fmt::Formatter;
@@ -128,6 +129,111 @@ pub fn auto_inherit(excluded: Vec<String>, dry_run: bool) -> Result<i32, anyhow:
     }
 
     // Inherit new "shared" dependencies in each member's manifest
+    inherit(
+        &graph,
+        &package_name2inherited_source,
+        &excluded,
+        dry_run,
+        &mut any_was_modified,
+    )?;
+
+    if dry_run && (any_was_modified || any_not_inheritable) {
+        Ok(1)
+    } else {
+        Ok(0)
+    }
+}
+
+pub fn uninherit(packages: Vec<String>) -> Result<(), anyhow::Error> {
+    let packages = BTreeSet::from_iter(packages);
+
+    let metadata = guppy::MetadataCommand::new().exec().context(
+        "Failed to execute `cargo metadata`. Was the command invoked inside a Rust project?",
+    )?;
+    let graph = metadata
+        .build_graph()
+        .context("Failed to build package graph")?;
+    let workspace_root = graph.workspace().root();
+    let mut root_manifest: Manifest = {
+        let contents = fs_err::read_to_string(workspace_root.join("Cargo.toml").as_std_path())
+            .context("Failed to read root manifest")?;
+        toml::from_str(&contents).context("Failed to parse root manifest")?
+    };
+    let Some(workspace) = &mut root_manifest.workspace else {
+        anyhow::bail!(
+            "`cargo autoinherit` can only be run in a workspace. \
+            The root manifest ({}) does not have a `workspace` field.",
+            workspace_root
+        )
+    };
+
+    let Some(workspace_deps) = &workspace.dependencies else {
+        anyhow::bail!(
+            "`cargo autoinherit can only uninherit when there are dependencies available."
+        )
+    };
+
+    for member_id in graph.workspace().member_ids() {
+        let package = graph.metadata(member_id)?;
+        if !packages.contains(package.name()) {
+            continue;
+        }
+
+        let manifest_contents = fs_err::read_to_string(package.manifest_path().as_std_path())
+            .context("Failed to read root manifest")?;
+        let manifest: Manifest =
+            toml::from_str(&manifest_contents).context("Failed to parse root manifest")?;
+        let mut manifest_toml: toml_edit::DocumentMut = manifest_contents
+            .parse()
+            .context("Failed to parse root manifest")?;
+
+        if let Some(package_deps) = &manifest.dependencies {
+            let deps_toml = manifest_toml["dependencies"]
+                .as_table_mut()
+                .expect("Failed to find `[dependencies]` table in root manifest.");
+            uninherit_deps(workspace_deps, package_deps, deps_toml);
+        }
+        if let Some(package_deps) = &manifest.dev_dependencies {
+            let deps_toml = manifest_toml["dev-dependencies"]
+                .as_table_mut()
+                .expect("Failed to find `[dev-dependencies]` table in root manifest.");
+            uninherit_deps(workspace_deps, package_deps, deps_toml);
+        }
+        if let Some(package_deps) = &manifest.build_dependencies {
+            let deps_toml = manifest_toml["build-dependencies"]
+                .as_table_mut()
+                .expect("Failed to find `[build-dependencies]` table in root manifest.");
+            uninherit_deps(workspace_deps, package_deps, deps_toml);
+        }
+
+        fs_err::write(
+            package.manifest_path().as_std_path(),
+            manifest_toml.to_string(),
+        )
+        .context("Failed to write manifest")?;
+    }
+
+    Ok(())
+}
+
+enum Action {
+    TryInherit(MinimalVersionSet),
+    Skip,
+}
+
+impl Default for Action {
+    fn default() -> Self {
+        Action::TryInherit(MinimalVersionSet::default())
+    }
+}
+
+fn inherit(
+    graph: &PackageGraph,
+    package_name2inherited_source: &BTreeMap<String, SharedDependency>,
+    excluded: &BTreeSet<String>,
+    dry_run: bool,
+    any_was_modified: &mut bool,
+) -> Result<(), anyhow::Error> {
     for member_id in graph.workspace().member_ids() {
         let package = graph.metadata(member_id)?;
         if excluded.contains(package.name()) {
@@ -177,7 +283,7 @@ pub fn auto_inherit(excluded: Vec<String>, dry_run: bool) -> Result<i32, anyhow:
         }
         if was_modified {
             if dry_run {
-                any_was_modified = true;
+                *any_was_modified = true;
                 eprintln!(
                     "Cargo.toml of package `{}` would be modified",
                     package.name()
@@ -192,22 +298,7 @@ pub fn auto_inherit(excluded: Vec<String>, dry_run: bool) -> Result<i32, anyhow:
         }
     }
 
-    if dry_run && (any_was_modified || any_not_inheritable) {
-        Ok(1)
-    } else {
-        Ok(0)
-    }
-}
-
-enum Action {
-    TryInherit(MinimalVersionSet),
-    Skip,
-}
-
-impl Default for Action {
-    fn default() -> Self {
-        Action::TryInherit(MinimalVersionSet::default())
-    }
+    Ok(())
 }
 
 fn inherit_deps(
@@ -247,6 +338,112 @@ fn inherit_deps(
 
                 insert_preserving_decor(toml_deps, name, toml_edit::Item::Value(inherited.into()));
                 *was_modified = true;
+            }
+        }
+    }
+}
+
+fn uninherit_deps(
+    workspace_deps: &DepsSet,
+    package_deps: &DepsSet,
+    toml_deps: &mut toml_edit::Table,
+) {
+    for (name, dep) in package_deps {
+        let dep_name = dep.package().unwrap_or(name.as_str());
+        if !workspace_deps.contains_key(dep_name) {
+            continue;
+        }
+
+        match dep {
+            Dependency::Simple(_) => {
+                // Nothing to do.
+            }
+            Dependency::Inherited(inherited_details) => {
+                let mut local = toml_edit::InlineTable::new();
+
+                match workspace_deps.get(dep_name) {
+                    Some(Dependency::Simple(version)) => {
+                        // Take the version from the workspace.
+                        local.insert(
+                            "version",
+                            toml_edit::value(version.to_string()).into_value().unwrap(),
+                        );
+
+                        // Take features and optional flag from the local inherited dependency spec.
+                        if let Some(features) = &inherited_details.features {
+                            local.insert(
+                                "features",
+                                toml_edit::Value::Array(Array::from_iter(features.iter())),
+                            );
+                        }
+                        if let Some(optional) = inherited_details.optional {
+                            local.insert(
+                                "optional",
+                                toml_edit::value(optional).into_value().unwrap(),
+                            );
+                        }
+                    }
+                    Some(Dependency::Detailed(details)) => {
+                        // Take all exclusive version specification from the workspace.
+                        macro_rules! insert_if_some {
+                            ($field_name:ident, $key_name:expr) => {
+                                if let Some(value) = &details.$field_name {
+                                    local.insert(
+                                        $key_name,
+                                        toml_edit::value(value).into_value().unwrap(),
+                                    );
+                                }
+                            };
+                        }
+
+                        insert_if_some!(version, "version");
+                        insert_if_some!(registry, "registry");
+                        insert_if_some!(registry_index, "registry_index");
+                        insert_if_some!(git, "git");
+                        insert_if_some!(branch, "branch");
+                        insert_if_some!(tag, "tag");
+                        insert_if_some!(rev, "rev");
+                        insert_if_some!(package, "package");
+
+                        if let Some(default) = details.default_features {
+                            local.insert(
+                                "default_features",
+                                toml_edit::value(default).into_value().unwrap(),
+                            );
+                        }
+
+                        // Take flags which can exist in the local spec and the workspace spec
+                        // first from the local spec and only fallback to the workspace spec.
+                        if let Some(features) = &inherited_details.features {
+                            local.insert(
+                                "features",
+                                toml_edit::Value::Array(Array::from_iter(features.iter())),
+                            );
+                        } else if let Some(features) = &details.features {
+                            local.insert(
+                                "features",
+                                toml_edit::Value::Array(Array::from_iter(features.iter())),
+                            );
+                        }
+                        if let Some(optional) = inherited_details.optional {
+                            local.insert(
+                                "optional",
+                                toml_edit::value(optional).into_value().unwrap(),
+                            );
+                        } else if let Some(optional) = details.optional {
+                            local.insert(
+                                "optional",
+                                toml_edit::value(optional).into_value().unwrap(),
+                            );
+                        }
+                    }
+                    None | Some(Dependency::Inherited(_)) => unreachable!(),
+                }
+
+                insert_preserving_decor(toml_deps, name, toml_edit::Item::Value(local.into()));
+            }
+            Dependency::Detailed(_) => {
+                // Nothing to do.
             }
         }
     }
